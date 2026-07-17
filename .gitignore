@@ -24,3 +24,4 @@ vendor/
 
 # PDF do enunciado (opcional — não é código)
 *.pdf
+!.env.example
