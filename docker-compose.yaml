@@ -1,0 +1,205 @@
+# =============================================================
+# ToggleMaster — Docker Compose (Ambiente Local com Azure)
+# =============================================================
+# Service Bus e Cosmos DB: Azure real (credenciais no .env)
+# PostgreSQL, Redis: containers locais
+#
+# ORDEM DE DEPENDÊNCIA (DAG):
+#  [auth-db]      → [auth-service]
+#  [flag-db]      → [flag-service]      → [evaluation-service]
+#  [targeting-db] → [targeting-service] → [evaluation-service]
+#  [redis]        → [evaluation-service]
+#  Azure Service Bus (real) → [evaluation-service] (publisher)
+#                           → [analytics-service]  (consumer)
+#  Azure Cosmos DB (real)   → [analytics-service]  (writer)
+# =============================================================
+
+networks:
+  rede-interna:
+    driver: bridge
+
+volumes:
+  auth-db-data:
+  flag-db-data:
+  targeting-db-data:
+  redis-data:
+
+services:
+
+  # ===========================================================
+  # CAMADA 1: INFRAESTRUTURA LOCAL
+  # ===========================================================
+
+  auth-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: authdb
+      POSTGRES_USER: auth_user
+      POSTGRES_PASSWORD: auth_password
+    volumes:
+      - auth-db-data:/var/lib/postgresql/data
+      - ./auth-service/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - rede-interna
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auth_user -d authdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  flag-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: flagdb
+      POSTGRES_USER: flag_user
+      POSTGRES_PASSWORD: flag_password
+    volumes:
+      - flag-db-data:/var/lib/postgresql/data
+      - ./flag-service/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - rede-interna
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flag_user -d flagdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  targeting-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: targetingdb
+      POSTGRES_USER: targeting_user
+      POSTGRES_PASSWORD: targeting_password
+    volumes:
+      - targeting-db-data:/var/lib/postgresql/data
+      - ./targeting-service/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - rede-interna
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U targeting_user -d targetingdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    networks:
+      - rede-interna
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================
+  # CAMADA 2: AUTH SERVICE
+  # ===========================================================
+
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: "postgres://auth_user:auth_password@auth-db:5432/authdb?sslmode=disable"
+      MASTER_KEY: "master-key-dev-local"
+      PORT: "8001"
+    ports:
+      - "8001:8001"
+    networks:
+      - rede-interna
+    depends_on:
+      auth-db:
+        condition: service_healthy
+
+  # ===========================================================
+  # CAMADA 3: CRUD SERVICES
+  # ===========================================================
+
+  flag-service:
+    build:
+      context: ./flag-service
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: "postgres://flag_user:flag_password@flag-db:5432/flagdb?sslmode=disable"
+      AUTH_SERVICE_URL: "http://auth-service:8001"
+      PORT: "8002"
+    ports:
+      - "8002:8002"
+    networks:
+      - rede-interna
+    depends_on:
+      flag-db:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+
+  targeting-service:
+    build:
+      context: ./targeting-service
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: "postgres://targeting_user:targeting_password@targeting-db:5432/targetingdb?sslmode=disable"
+      AUTH_SERVICE_URL: "http://auth-service:8001"
+      PORT: "8003"
+    ports:
+      - "8003:8003"
+    networks:
+      - rede-interna
+    depends_on:
+      targeting-db:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+
+  # ===========================================================
+  # CAMADA 4: EVALUATION SERVICE (hot path)
+  # ===========================================================
+
+  evaluation-service:
+    build:
+      context: ./evaluation-service
+      dockerfile: Dockerfile
+    environment:
+      REDIS_URL: "redis://redis:6379"
+      FLAG_SERVICE_URL: "http://flag-service:8002"
+      TARGETING_SERVICE_URL: "http://targeting-service:8003"
+      # Lidas do .env via interpolação do docker-compose
+      SERVICE_API_KEY: "${SERVICE_API_KEY}"
+      SERVICE_BUS_CONNECTION_STRING: "${SERVICE_BUS_CONNECTION_STRING}"
+      SERVICE_BUS_QUEUE_NAME: "${SERVICE_BUS_QUEUE_NAME}"
+      PORT: "8004"
+    ports:
+      - "8004:8004"
+    networks:
+      - rede-interna
+    depends_on:
+      redis:
+        condition: service_healthy
+      flag-service:
+        condition: service_started
+      targeting-service:
+        condition: service_started
+
+  # ===========================================================
+  # CAMADA 5: ANALYTICS SERVICE (consumer assíncrono)
+  # ===========================================================
+
+  analytics-service:
+    build:
+      context: ./analytics-service
+      dockerfile: Dockerfile
+    environment:
+      # Lidas do .env via interpolação do docker-compose
+      SERVICE_BUS_CONNECTION_STRING: "${SERVICE_BUS_CONNECTION_STRING}"
+      SERVICE_BUS_QUEUE_NAME: "${SERVICE_BUS_QUEUE_NAME}"
+      COSMOS_ENDPOINT: "${COSMOS_ENDPOINT}"
+      COSMOS_KEY: "${COSMOS_KEY}"
+      COSMOS_DATABASE: "${COSMOS_DATABASE}"
+      COSMOS_CONTAINER: "${COSMOS_CONTAINER}"
+      PORT: "8005"
+    ports:
+      - "8005:8005"
+    networks:
+      - rede-interna

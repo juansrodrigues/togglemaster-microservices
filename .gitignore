@@ -1,0 +1,26 @@
+# Credenciais — NUNCA commitar
+.env
+.env.*
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Go
+vendor/
+*.exe
+*.test
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# PDF do enunciado (opcional — não é código)
+*.pdf
